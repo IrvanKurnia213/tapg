@@ -1,0 +1,176 @@
+version: '3.8'
+
+services:
+  airbyte-db:
+    image: postgres:latest
+    ports:
+      - "5433:5432"
+    restart: no
+    environment:
+      POSTGRES_USER: airbyte
+      POSTGRES_PASSWORD: airbyte
+      POSTGRES_DB: airbyte
+    networks:
+      - elt_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airbyte"]
+      interval: 5s
+      retries: 5
+      start_period: 10s
+
+  airbyte-temporal:
+    image: airbyte/temporal:1.0.0
+    restart: no
+    entrypoint: ["/etc/temporal/entrypoint.sh"]
+    environment:
+      - TEMPORAL_ADDRESS=airbyte-temporal:7233
+      - DB=postgresql
+      - POSTGRES_USER=airbyte
+      - POSTGRES_PASSWORD=airbyte
+      - POSTGRES_HOST=airbyte-db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=airbyte
+      - DATABASE_URL=jdbc:postgresql://airbyte-db:5432/airbyte
+      - POSTGRES_NAMESPACE=default
+      - POSTGRES_MAX_CONN=100
+      - POSTGRES_SSLMODE=disable
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+    networks:
+      - elt_network
+
+  airbyte-server:
+    image: airbyte/server:1.0.0
+    restart: no
+    depends_on:
+      - airbyte-temporal
+    ports:
+      - "8001:8001"
+    environment:
+      - AIRBYTE_ROLE=server
+      - TEMPORAL_HOST=airbyte-temporal:7233
+      - DATABASE_USER=airbyte
+      - DATABASE_PASSWORD=airbyte
+      - DATABASE_URL=jdbc:postgresql://airbyte-db:5432/airbyte
+      - AIRBYTE_WORKSPACE_ROOT=/tmp/airbyte_workspace
+    networks:
+      - elt_network
+    volumes:
+      - ./airbyte_workspace:/tmp/airbyte_workspace
+
+  airbyte-keycloak:
+    image: quay.io/keycloak/keycloak:20.0
+    restart: no
+    command: ["start-dev"]
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+    ports:
+      - "8180:8080"
+    networks:
+      - elt_network
+
+  airbyte-webapp:
+    image: airbyte/webapp:1.0.0
+    restart: no
+    depends_on:
+      - airbyte-server
+      - airbyte-keycloak
+    ports:
+      - "8000:80"
+    environment:
+      - AIRBYTE_SERVER_HOST=airbyte-server
+      - CONNECTOR_BUILDER_API_HOST=airbyte-server
+      - KEYCLOAK_INTERNAL_HOST=airbyte-keycloak
+    networks:
+      - elt_network
+
+  airflow-postgres:
+    image: postgres:13
+    ports:
+      - "5434:5432"
+    networks:
+      - elt_network
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+
+  init-airflow:
+    image: apache/airflow:latest
+    depends_on:
+      - airflow-postgres
+      - airbyte-db
+    networks:
+      - elt_network
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    command: >
+      bash -c "airflow db init && 
+               airflow users create --username airflow --password airflow --firstname John --lastname Doe --role Admin --email admin@example.com"
+
+  webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - airflow-postgres
+    networks:
+      - elt_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOAD_EX=n
+      - EXECUTOR=Local
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      - AIRFLOW__CORE__FERNET_KEY=plIipb9RU3-3wJ1UNaAtqVNJrqFEks1-dGbJM34EW7U=
+      - AIRFLOW__WEBSERVER__DEFAULT_USER_USERNAME=airflow
+      - AIRFLOW__WEBSERVER__DEFAULT_USER_PASSWORD=airflow
+      - AIRFLOW_WWW_USER_USERNAME=airflow
+      - AIRFLOW_WWW_USER_PASSWORD=airflow
+      - AIRFLOW__WEBSERVER__SECRET_KEY=secret
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - airflow-postgres
+    networks:
+      - elt_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOAD_EX=n
+      - EXECUTOR=Local
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      - AIRFLOW__CORE__FERNET_KEY=plIipb9RU3-3wJ1UNaAtqVNJrqFEks1-dGbJM34EW7U=
+      - AIRFLOW__CORE__PARALLELISM=4
+      - AIRFLOW__SCHEDULER__DAG_CONCURRENCY=2
+      - AIRFLOW__SCHEDULER__MAX_ACTIVE_RUNS_PER_DAG=2
+      - AIRFLOW__WEBSERVER__SECRET_KEY=secret
+      - AIRFLOW_WWW_USER_USERNAME=airflow
+      - AIRFLOW_WWW_USER_PASSWORD=airflow
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    command: scheduler
+
+networks:
+  elt_network:
+    driver: bridge
+    external: true
+
+volumes:
+  analytics_data:
+  airbyte_workspace:
